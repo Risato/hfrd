@@ -14,6 +14,7 @@ usgsGeo := geom_usgs
 usgsproj4 := +proj=longlat +ellps=GRS80 +no_defs
 lemmaSrid := 5070
 buffsize := 100
+nixHost := ~/host/hfrdgis/
 
 db:
 	createdb ${dbname}
@@ -81,10 +82,14 @@ products/sce_vegst.geojson: products/shaver_projarea.geojson
 	${PG} -f vegstrata.sql
 	ogr2ogr -overwrite  -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" sce_vegstrata
 
-products/sce_plots.shp:
-	shp2pgsql -s 4326:3741 -d -I SCE/SCE_GPS_Measurements/plots_812/hfrd/shaver_plots.shp sce_plots | psql -d hfrd
-	psql -d ${dbname} -v t='sce_plots' -f shaver_plots.sql
-	pgsql2shp -f $@ hfrd 'select p.gid plotid, p.geom, hfrd_uid from sce_plots p join sce_clean s on st_contains(s.geom, p.geom)'
+products/sce_plots:
+	shp2pgsql -s 4326:3741 -d -I ${nixHost}SCE/SCE_GPS_Measurements/plots_812/hfrd/shaver_plots.shp sce_812_plots | psql -d hfrd
+	shp2pgsql -s 3741 -d -I ${nixHost}SCE/SCELib/plots/sce_plots.shp sce_plots | psql -d hfrd
+	psql -d ${dbname} -v t='sce_plots' -f sce_plots.sql
+	pgsql2shp -f $@.shp hfrd 'select * from sce_plots p'
+	zip $@.zip $@.*
+	rm $@.geojson
+	ogr2ogr -overwrite  -t_srs EPSG:4326 -f GeoJSON $@.geojson PG:"dbname=${dbname}" "sce_plots"
 
 .PHONY: shaver
 shaver: products/sce_clean.geojson db/shaver_road products/shaver_slope.geojson
@@ -132,6 +137,13 @@ db/bb_strata:
 	shp2pgsql -s 26911:${srid} -d -I  "Mountain Top/Demo_3.shp" bb_tlevel | ${PG}
 	shp2pgsql -s 26911:${srid} -d -I  "Mountain Top/Demo_RCA.shp" bb_rca | ${PG}
 
+products/bb_rca.geojson:
+	ogr2ogr -overwrite -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" -sql "select st_force2d((st_dump(geom)).geom) geom from bb_rca"
+
+products/bb_tlevel.geojson:
+	ogr2ogr -overwrite -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" -sql "select st_force2d((st_dump(geom)).geom) geom from bb_tlevel"
+
+
 products/bb_eunits.geojson:
 	rm -f $@
 	ogr2ogr -overwrite -preserve_fid -t_srs "${usgsproj4}" -f GeoJSON $@ PG:"dbname=${dbname}" -sql "select geom, gid, equipment from bb_eunits"
@@ -144,16 +156,36 @@ products/bb_slope.geojson: products/bb_projarea.geojson
 	rm -f $@
 	ogr2ogr -overwrite -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" -sql  "select p.geom,value,cl,ch, cl||'-'||ch||'%' as slope_range from bb_projareaslope p join slopecat on(value=index)"
 
-db/bb_gnnveg: products/bb_projarea.geojson
-	gdalwarp -q -overwrite -cutline "PG:dbname=${dbname}" -csql "select st_transform(st_buffer(st_concavehull(st_collect(geom), .99),${buffsize}),${lemmaSrid}) geom from sce_clean" -crop_to_cutline -t_srs EPSG:${srid} -of GTiff /home/user/host/Downloads/gnn_sppsz_2014_08_28/mr200_2012/w001001.adf src_data/gnn_bb.tif
+db/bb_gnnveg:
+	gdalwarp -q -overwrite -cutline "PG:dbname=${dbname}" -csql "select st_transform(st_buffer(st_concavehull(st_collect(geom), .99),${buffsize}),${lemmaSrid}) geom from bb_projarea" -crop_to_cutline -t_srs EPSG:${srid} -of GTiff /home/user/host/Downloads/gnn_sppsz_2014_08_28/mr200_2012/w001001.adf src_data/gnn_bb.tif
 	gdal_polygonize.py src_data/gnn_bb.tif -f PostgreSQL "PG:dbname=${dbname}" bb_veg 
 	${PG} -c 'delete from bb_veg where dn=0;'
 	${PG} -c 'delete from bb_veg where dn is null;'
 	touch $@
 
+products/bb_clean.geojson:
+	${cdb2local} "CartoDB:biomass tables=bb_equip_assign"
+	${cdb2local} "CartoDB:biomass tables=bb_boundaries"
+	${PG} -f bb_clean.sql
+	ogr2ogr -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" "bb_clean"
+
+products/bb_strata.geojson:
+	${cdb2local} "CartoDB:biomass tables=bb_tlev_bnd"
+	${cdb2local} "CartoDB:biomass tables=bb_tlevel_poly"
+	${PG} -f bb_strata.sql
+	ogr2ogr -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" "bb_s_strata"
+
+products/bb_plots.geojson:
+	${PG} -c "drop table if exists bb_plots; create table bb_plots as with foo as (select hfrd_uid, st_buffer(geom, -12) geom from bb_s_strata) select randompointsinpolygon(geom,4), hfrd_uid, generate_series(1,4) spid from foo where st_area(geom) > 144; alter table bb_plots add column pid serial primary key; update bb_plots set hfrd_uid = hfrd_uid||'_'||pid||'_'||spid"
+	pgsql2shp -r -f products/bb_plots.shp ${dbname} bb_plots
+	ogr2ogr -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" "bb_plots"
+.PHONY: plots
+plots : products/bb_clean.geojson products/bb_strata.geojson products/bb_plots.geojson
+## Vegstrata.sql is conficured for shaver. do not use...
 products/bb_vegst.geojson:db/bb_gnnveg
-	${PG} -f vegstrata.sql
+	${PG} -f bb_vegstrata.sql
 	ogr2ogr -overwrite  -t_srs EPSG:4326 -f GeoJSON $@ PG:"dbname=${dbname}" sce_vegstrata
+https://biomass.cartodb.com/api/v2/sql?filename=bb_clean&q=select+*+from+sce_clean&format=shp
 
 .PHONY: bigbear
 bigbear: products/bb_slope.geojson products/bb_eunits.geojson products/bb_projarea.geojson
